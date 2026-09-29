@@ -4,16 +4,20 @@ plugins {
 
 group = "mcbuilder.buildlogic"
 
-java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
-}
-
 repositories {
     gradlePluginPortal()
     mavenCentral()
 }
 
 dependencies {
-    implementation("com.github.jengelman.gradle.plugins:shadow:8.1.1")
+    implementation("com.gradleup.shadow:shadow-gradle-plugin:9.6.1")
+}
+
+gradlePlugin {
+    plugins {
+        register("mcbuilderModule") {
+            id = "mcbuilder.module"
+            implementationClass = "mcbuilder.module.McModulePlugin"
+        }
+    }
 }

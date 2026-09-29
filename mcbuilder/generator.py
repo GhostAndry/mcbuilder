@@ -71,13 +71,25 @@ class ServerData:
     def versions(self, key: str) -> list[str]:
         return list(self.servers.get(key, {}).get("versions", {}).keys())
 
-    def dependencies(self, key: str, version: str) -> list[str]:
-        deps = self.servers.get(key, {}).get("dependencies", [])
-        return [d.replace("{version}", version) for d in deps]
+    def resolve_version(self, key: str, label: str) -> str:
+        versions = self.servers.get(key, {}).get("versions", {})
+        if isinstance(versions, dict):
+            return versions.get(label, label)
+        return label
 
-    def extra(self, key: str, version: str) -> str:
-        extra = self.servers.get(key, {}).get("extra", "")
-        return extra.replace("{version}", version)
+    def dependencies(self, key: str, version: str) -> list[str]:
+        resolved = self.resolve_version(key, version)
+        deps = self.servers.get(key, {}).get("dependencies", [])
+        return [d.replace("{version}", resolved) for d in deps]
+
+    def platform(self, key: str) -> str:
+        return self.servers.get(key, {}).get("platform", "bukkit")
+
+    def java_version(self, key: str, label: str, default: str = "17") -> str:
+        versions = self.servers.get(key, {}).get("java", {})
+        if isinstance(versions, dict):
+            return versions.get(label, default)
+        return default
 
 
 class ProjectGenerator:
@@ -103,6 +115,13 @@ class ProjectGenerator:
         gradle_dir = output_dir / "gradle" / "wrapper"
         gradle_dir.mkdir(parents=True, exist_ok=True)
         self._write_file(gradle_dir / "gradle-wrapper.properties", self._read_template("gradle-wrapper.properties").replace("{gradle_version}", self.config.gradle_version))
+        self._copy_binary(gradle_dir / "gradle-wrapper.jar", self.template_dir / "gradle-wrapper.jar")
+        self._write_file(output_dir / "gradlew", self._read_template("gradlew"))
+        self._write_file(output_dir / "gradlew.bat", self._read_template("gradlew.bat"))
+        try:
+            (output_dir / "gradlew").chmod(0o755)
+        except OSError:
+            pass
 
         self._generate_build_logic(output_dir)
         if self.config.include_api:
@@ -142,19 +161,17 @@ class ProjectGenerator:
 
     def _generate_build_logic(self, root: Path) -> None:
         bl = root / "buildLogic"
-        (bl / "convention" / "src" / "main" / "kotlin").mkdir(parents=True, exist_ok=True)
+        kotlin_dir = bl / "src" / "main" / "kotlin"
 
         self._write_file(bl / "settings.gradle.kts", self._read_template("buildLogic/settings.gradle.kts"))
         self._write_file(bl / "build.gradle.kts", self._read_template("buildLogic/build.gradle.kts"))
-        self._write_file(bl / "convention" / "build.gradle.kts", self._read_template("buildLogic/convention/build.gradle.kts"))
 
-        base_kt = (self.template_dir / "buildLogic" / "convention" / "src" / "main" / "kotlin" / "mcbuilder" / "base" / "McBasePlugin.kt")
-        module_kt = (self.template_dir / "buildLogic" / "convention" / "src" / "main" / "kotlin" / "mcbuilder" / "module" / "McModulePlugin.kt")
-
-        if base_kt.exists():
-            self._write_file(bl / "convention" / "src" / "main" / "kotlin" / "mcbuilder" / "base" / "McBasePlugin.kt", base_kt.read_text())
-        if module_kt.exists():
-            self._write_file(bl / "convention" / "src" / "main" / "kotlin" / "mcbuilder" / "module" / "McModulePlugin.kt", module_kt.read_text())
+        for rel in (
+            "mcbuilder/module/McModulePlugin.kt",
+        ):
+            src = self.template_dir / "buildLogic" / "src" / "main" / "kotlin" / rel
+            if src.exists():
+                self._write_file(kotlin_dir / rel, src.read_text())
 
     def _generate_api(self, root: Path) -> None:
         self._write_file(root / "api" / "build.gradle.kts", (
@@ -165,10 +182,18 @@ class ProjectGenerator:
             '    withSourcesJar()\n}\n'
         ))
         package = self.config.group + ".api"
+        package_path = root / "api" / "src" / "main" / "java" / Path(*package.split("."))
         self._write_file(
-            root / "api" / "src" / "main" / "java" / Path(*package.split(".")) / "package-info.java",
-            '/** Public interfaces and contracts shared by the server modules. */\n'
-            f'package {package};\n',
+            package_path / "ProjectApi.java",
+            f"package {package};\n\n"
+            "import java.util.UUID;\n\n"
+            "/** Shared API surface implemented by the server modules. */\n"
+            "public interface ProjectApi {\n\n"
+            "    /** @return the project name, stable across platforms. */\n"
+            "    String projectName();\n\n"
+            "    /** @return whether the given player is currently known to the module. */\n"
+            "    boolean isKnown(UUID playerId);\n"
+            "}\n",
         )
 
     def _generate_module(self, root: Path, module: Module) -> None:
@@ -183,41 +208,93 @@ class ProjectGenerator:
             deps.insert(0, 'implementation(project(":api"))')
         deps_str = "\n    ".join(deps) if deps else ""
 
-        extra = self.server_data.extra(module.server, module.version)
-        if extra:
-            extra = "\n" + extra
-
         template = self._read_template("build.gradle.kts.module")
-        content = template.replace("{dependencies}", deps_str).replace("{extra_config}", extra)
+        content = (
+            template
+            .replace("{dependencies}", deps_str)
+            .replace("{java_version}", self.server_data.java_version(module.server, module.version, self.config.java_version))
+        )
         self._write_file(mod_dir / "build.gradle.kts", content)
 
-        plugin_yml = self._render_plugin_yml(module)
-        if plugin_yml:
-            self._write_file(src_resources / "plugin.yml", plugin_yml)
-
+        platform = self.server_data.platform(module.server)
         package = self.config.group
+        class_name = self._class_name(module.name)
+
+        if platform == "velocity":
+            pass
+        elif platform == "bungee":
+            self._write_file(src_resources / "bungee.yml", self._render_bungee_yml(module, class_name))
+        else:
+            self._write_file(src_resources / "plugin.yml", self._render_plugin_yml(module, class_name))
+
         package_path = mod_dir / "src" / "main" / "java" / Path(*package.split("."))
         package_path.mkdir(parents=True, exist_ok=True)
-        main_class = f"{package}.{self._class_name(module.name)}"
         self._write_file(
-            package_path / f"{self._class_name(module.name)}.java",
-            self._render_main_class(main_class, module),
+            package_path / f"{class_name}.java",
+            self._render_main_class(class_name, module, platform),
         )
 
-    def _render_plugin_yml(self, module: Module) -> str:
+    def _render_plugin_yml(self, module: Module, class_name: str) -> str:
         return (
             f"name: {module.name}\n"
-            f"version: {self.config.version}\n"
-            f"main: {self.config.group}.{self._class_name(module.name)}\n"
+            f"version: '{self.config.version}'\n"
+            f"main: {self.config.group}.{class_name}\n"
             f"description: {self.config.description or module.name}\n"
             f"api-version: '{module.version.split('-')[0]}'\n"
+            f"author: {self.config.group}\n"
         )
 
-    def _render_main_class(self, class_name: str, module: Module) -> str:
+    def _render_bungee_yml(self, module: Module, class_name: str) -> str:
         return (
-            f"package {self.config.group};\n\n"
+            f"name: {module.name}\n"
+            f"version: '{self.config.version}'\n"
+            f"main: {self.config.group}.{class_name}\n"
+            f"description: {self.config.description or module.name}\n"
+            f"author: {self.config.group}\n"
+        )
+
+    def _render_main_class(self, class_name: str, module: Module, platform: str) -> str:
+        pkg = self.config.group
+        if platform == "velocity":
+            plugin_id = re.sub(r"[^a-z0-9_-]", "-", module.name.lower())
+            return (
+                f"package {pkg};\n\n"
+                f"import com.google.inject.Inject;\n"
+                f"import com.velocitypowered.api.event.Subscribe;\n"
+                f"import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;\n"
+                f"import com.velocitypowered.api.plugin.Plugin;\n"
+                f"import com.velocitypowered.api.proxy.ProxyServer;\n"
+                f"import org.slf4j.Logger;\n\n"
+                f"@Plugin(id = \"{plugin_id}\")\n"
+                f"public final class {class_name} {{\n\n"
+                f"    private final ProxyServer server;\n"
+                f"    private final Logger logger;\n\n"
+                f"    @Inject\n"
+                f"    public {class_name}(ProxyServer server, Logger logger) {{\n"
+                f"        this.server = server;\n"
+                f"        this.logger = logger;\n"
+                f"    }}\n\n"
+                f"    @Subscribe\n"
+                f"    public void onProxyInitialize(ProxyInitializeEvent event) {{\n"
+                f"        logger.info(\"{module.name} enabled.\");\n"
+                f"    }}\n"
+                f"}}\n"
+            )
+        if platform == "bungee":
+            return (
+                f"package {pkg};\n\n"
+                f"import net.md_5.bungee.api.plugin.Plugin;\n\n"
+                f"public final class {class_name} extends Plugin {{\n"
+                f"    @Override\n"
+                f"    public void onEnable() {{\n"
+                f"        getLogger().info(\"{module.name} enabled.\");\n"
+                f"    }}\n"
+                f"}}\n"
+            )
+        return (
+            f"package {pkg};\n\n"
             f"import org.bukkit.plugin.java.JavaPlugin;\n\n"
-            f"public final class {self._class_name(module.name)} extends JavaPlugin {{\n"
+            f"public final class {class_name} extends JavaPlugin {{\n"
             f"    @Override\n"
             f"    public void onEnable() {{\n"
             f"        getLogger().info(\"{module.name} enabled.\");\n"
@@ -240,3 +317,7 @@ class ProjectGenerator:
     def _write_file(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+    def _copy_binary(self, dest: Path, src: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(src.read_bytes())
