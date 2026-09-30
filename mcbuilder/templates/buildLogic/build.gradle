@@ -1,0 +1,41 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow' version '9.6.1'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+dependencies {
+{dependencies}
+}
+
+tasks.jar {
+    enabled = false
+}
+
+tasks.shadowJar {
+    archiveBaseName.set(rootProject.name)
+    archiveVersion.set(rootProject.version)
+    archiveClassifier.set("")
+    mergeServiceFiles()
+    zip64 = true
+    enabled = true
+}
+
+tasks.build {
+    dependsOn tasks.shadowJar
+}
+
+tasks.register('copyUnifiedJar', Copy) {
+    dependsOn tasks.shadowJar
+    from tasks.shadowJar
+    into rootProject.layout.buildDirectory.dir('libs')
+}
+
+tasks.build {
+    finalizedBy 'copyUnifiedJar'
+}

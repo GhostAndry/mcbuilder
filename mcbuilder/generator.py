@@ -1,44 +1,51 @@
-"""Project generation logic."""
+"""Project generation logic (Aurora-style multi-platform template)."""
 from __future__ import annotations
 
 import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+
 from .gradle_versions import DEFAULT_GRADLE
 
-
-@dataclass
-class Module:
-    server: str
-    version: str
-    name: str = ""
-
-    def __post_init__(self):
-        if not self.name:
-            parts = [self.server, self.version]
-            self.name = "-".join(parts)
-
-    @property
-    def path(self) -> str:
-        return self.name
+BUKKIT = "bukkit"
+VELOCITY = "velocity"
 
 
 @dataclass
 class ProjectConfig:
     name: str
     group: str
-    version: str
+    version: str = "1.0.0"
     description: str = ""
-    java_version: str = "17"
+    java_version: str = "21"
     gradle_version: str = DEFAULT_GRADLE
-    modules: list[Module] = field(default_factory=list)
-    include_api: bool = False
+    platforms: list[str] = field(default_factory=lambda: [BUKKIT])
+    include_api: bool = True
+    include_common: bool = True
+    include_nms: bool = False
+    nms_versions: list[str] = field(default_factory=list)
 
     @property
     def root(self) -> str:
         return self.name
+
+    @property
+    def slug(self) -> str:
+        s = re.sub(r"[^a-z0-9]", "", self.name.lower())
+        return s or "plugin"
+
+    @property
+    def base_package(self) -> str:
+        return f"{self.group}.{self.slug}"
+
+    @property
+    def class_prefix(self) -> str:
+        parts = re.split(r"[^A-Za-z0-9]+", self.name)
+        return "".join(p[:1].upper() + p[1:] for p in parts if p) or "Plugin"
+
+    def module(self, *parts: str) -> str:
+        return f"{self.base_package}.{'.'.join(parts)}"
 
 
 def sanitize(name: str) -> str:
@@ -46,278 +53,576 @@ def sanitize(name: str) -> str:
     name = name.strip()
     name = re.sub(r"[^\w\-.]", "-", name)
     name = re.sub(r"-+", "-", name)
-    return name.strip("-").lower() or "project"
+    return name.strip("-") or "project"
 
 
-class ServerData:
-    """Loads server software metadata."""
+class NmsData:
+    """Loads the NMS version catalogue."""
 
     def __init__(self, data_path: Path):
-        self.data_path = data_path
-        self.servers: dict = {}
-        self._load()
+        self.data = {}
+        if data_path.exists():
+            self.data = json.loads(data_path.read_text(encoding="utf-8"))
 
-    def _load(self):
-        if self.data_path.exists():
-            with self.data_path.open("r", encoding="utf-8") as f:
-                self.servers = json.load(f)
+    def versions(self) -> list[str]:
+        return list(self.data.keys())
 
-    def server_names(self) -> list[str]:
-        return list(self.servers.keys())
-
-    def display_name(self, key: str) -> str:
-        return self.servers.get(key, {}).get("name", key.title())
-
-    def versions(self, key: str) -> list[str]:
-        return list(self.servers.get(key, {}).get("versions", {}).keys())
-
-    def resolve_version(self, key: str, label: str) -> str:
-        versions = self.servers.get(key, {}).get("versions", {})
-        if isinstance(versions, dict):
-            return versions.get(label, label)
-        return label
-
-    def dependencies(self, key: str, version: str) -> list[str]:
-        resolved = self.resolve_version(key, version)
-        deps = self.servers.get(key, {}).get("dependencies", [])
-        return [d.replace("{version}", resolved) for d in deps]
-
-    def platform(self, key: str) -> str:
-        return self.servers.get(key, {}).get("platform", "bukkit")
-
-    def java_version(self, key: str, label: str, default: str = "17") -> str:
-        versions = self.servers.get(key, {}).get("java", {})
-        if isinstance(versions, dict):
-            return versions.get(label, default)
-        return default
+    def info(self, version: str) -> dict:
+        return self.data.get(version, {})
 
 
 class ProjectGenerator:
-    """Generates the multi-module Gradle project on disk."""
+    """Generates the multi-platform Gradle project on disk."""
 
-    def __init__(self, config: ProjectConfig, server_data: ServerData, template_dir: Path):
+    def __init__(self, config: ProjectConfig, nms_data: NmsData, template_dir: Path):
         self.config = config
-        self.server_data = server_data
+        self.nms = nms_data
         self.template_dir = template_dir
+
+    # ------------------------------------------------------------------ public
 
     def generate(self, output_dir: Path) -> None:
         if not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", self.config.gradle_version):
             raise ValueError("Versione Gradle non valida: usa una release stabile, es. 9.8.0")
-        output_dir = output_dir / self.config.name
-        output_dir.mkdir(parents=True, exist_ok=True)
+        root = output_dir / self.config.name
+        root.mkdir(parents=True, exist_ok=True)
 
-        self._write_file(output_dir / "settings.gradle.kts", self._render_settings())
-        self._write_file(output_dir / "build.gradle.kts", self._read_template("build.gradle.kts.root"))
-        self._write_file(output_dir / ".gitignore", self._read_template(".gitignore"))
-        self._write_file(output_dir / "gradle.properties", self._render_gradle_props())
-        self._write_file(output_dir / "README.md", self._render_readme())
+        self._write(root / "settings.gradle", self._render_settings())
+        self._write(root / "build.gradle", self._render_root_build())
+        self._write(root / "gradle.properties", self._render_gradle_props())
+        self._write(root / ".gitignore", self._read(".gitignore"))
+        self._write(root / "README.md", self._render_readme())
+        self._write(root / "build.sh", self._read("build.sh"))
+        self._chmod_exec(root / "build.sh")
+        self._write_wrapper(root)
 
-        gradle_dir = output_dir / "gradle" / "wrapper"
-        gradle_dir.mkdir(parents=True, exist_ok=True)
-        self._write_file(gradle_dir / "gradle-wrapper.properties", self._read_template("gradle-wrapper.properties").replace("{gradle_version}", self.config.gradle_version))
-        self._copy_binary(gradle_dir / "gradle-wrapper.jar", self.template_dir / "gradle-wrapper.jar")
-        self._write_file(output_dir / "gradlew", self._read_template("gradlew"))
-        self._write_file(output_dir / "gradlew.bat", self._read_template("gradlew.bat"))
-        try:
-            (output_dir / "gradlew").chmod(0o755)
-        except OSError:
-            pass
-
-        self._generate_build_logic(output_dir)
+        self._generate_build_logic(root)
         if self.config.include_api:
-            self._generate_api(output_dir)
-        for module in self.config.modules:
-            self._generate_module(output_dir, module)
+            self._generate_api(root)
+        if self.config.include_common:
+            self._generate_common(root)
+        for platform in self.config.platforms:
+            if platform == BUKKIT:
+                self._generate_bukkit(root)
+            elif platform == VELOCITY:
+                self._generate_velocity(root)
+        if self.config.include_nms:
+            self._generate_nms(root)
+
+    # ------------------------------------------------------------- root files
 
     def _render_settings(self) -> str:
-        includes = "\n".join(f'include("{m.name}")' for m in self.config.modules)
-        if self.config.include_api:
-            includes = 'include("api")\n' + includes
-        template = self._read_template("settings.gradle.kts")
-        return template.replace("{project_name}", self.config.name).replace("{module_includes}", includes)
+        cfg = self.config
+        lines = [f"rootProject.name = '{cfg.name}'", "", "include 'buildLogic'"]
+        if cfg.include_api:
+            lines.append("include 'api'")
+        if cfg.include_common:
+            lines.append("include 'common'")
+        for platform in cfg.platforms:
+            lines.append(f"include '{platform}'")
+        if cfg.include_nms:
+            lines += ["", "// NMS modules"]
+            lines.append("include 'nms:nms-api'")
+            lines.append("include 'nms:nms-loader'")
+            lines.append("include 'nms:nms-paper-modern'")
+            lines.append("")
+            lines.append("// Version-specific NMS modules require Spigot BuildTools JARs in")
+            lines.append("// each module's lib/ folder. Uncomment modules you have built.")
+            for version in cfg.nms_versions:
+                mc = self.nms.info(version).get("mc", "?")
+                lines.append(f"include 'nms:nms-{version}'  // {mc}")
+        return "\n".join(lines) + "\n"
+
+    def _render_root_build(self) -> str:
+        cfg = self.config
+        platform_projects = ", ".join(f"':{p}'" for p in cfg.platforms)
+        return f"""subprojects {{
+    apply plugin: 'java'
+
+    group = rootProject.group
+    version = rootProject.version
+
+    repositories {{
+        mavenLocal()
+        mavenCentral()
+        maven {{ url = 'https://repo.papermc.io/repository/maven-public/' }}
+        maven {{ url = 'https://hub.spigotmc.org/nexus/content/repositories/snapshots/' }}
+        maven {{ url = 'https://jitpack.io' }}
+    }}
+
+    dependencies {{
+        compileOnly 'org.jetbrains:annotations:{self._versions()['annotations']}'
+    }}
+
+    java {{
+        toolchain.languageVersion.set(JavaLanguageVersion.of({cfg.java_version}))
+    }}
+
+    tasks.withType(JavaCompile).configureEach {{
+        options.encoding = 'UTF-8'
+    }}
+}}
+
+// Unified jar is produced by :buildLogic (see buildLogic/build.gradle).
+// Platform modules: {platform_projects}
+"""
 
     def _render_gradle_props(self) -> str:
+        v = self._versions()
         return (
-            f"org.gradle.jvmargs=-Xmx2048M\n"
-            f"org.gradle.parallel=true\n"
-            f"org.gradle.caching=true\n"
+            "# Project\n"
             f"group={self.config.group}\n"
-            f"version={self.config.version}\n"
+            f"version={self.config.version}\n\n"
+            "# Dependency versions\n"
+            f"paperVersion={v['paper']}\n"
+            f"velocityVersion={v['velocity']}\n"
+            f"annotationsVersion={v['annotations']}\n"
+            f"lombokVersion={v['lombok']}\n"
+            f"junitVersion={v['junit']}\n"
         )
 
     def _render_readme(self) -> str:
-        modules_list = "\n".join(f"- `{m.name}` ({m.server} {m.version})" for m in self.config.modules)
-        if self.config.include_api:
-            modules_list = "- `api`: shared Java interfaces and contracts, used by every server module.\n" + modules_list
+        cfg = self.config
+        modules = []
+        if cfg.include_api:
+            modules.append("- `api` — interfaces and public API")
+        if cfg.include_common:
+            modules.append("- `common` — shared implementations")
+        if BUKKIT in cfg.platforms:
+            modules.append("- `bukkit` — Paper/Bukkit plugin")
+        if VELOCITY in cfg.platforms:
+            modules.append("- `velocity` — Velocity proxy plugin")
+        if cfg.include_nms:
+            modules.append("- `nms/` — version-agnostic NMS abstraction + per-version modules")
+        modules.append("- `buildLogic` — aggregates every module into a single unified jar")
+        body = "\n".join(modules)
+        nms_note = ""
+        if cfg.include_nms and cfg.nms_versions:
+            nms_note = (
+                "\n## NMS BuildTools\n\n"
+                "Version-specific `nms-v*` modules compile against Spigot/Paper jars you must\n"
+                "generate with [BuildTools](https://www.spigotmc.org/wiki/buildtools/) and place in\n"
+                "`nms/<module>/lib/`. Modules without their jars are commented out in\n"
+                "`settings.gradle`.\n"
+            )
         return (
-            f"# {self.config.name}\n\n"
-            f"{self.config.description}\n\n"
-            f"**Group:** `{self.config.group}` · **Version:** `{self.config.version}`\n\n"
-            f"## Modules\n\n{modules_list}\n\n"
-            f"## Build\n\n"
-            f"```bash\n./gradlew shadowJar\n```\n\n"
-            f"Unified JAR: `build/libs/`\n"
+            f"# {cfg.name}\n\n"
+            f"{cfg.description}\n\n"
+            f"**Group:** `{cfg.group}` · **Version:** `{cfg.version}`\n\n"
+            f"## Modules\n\n{body}\n"
+            f"{nms_note}\n"
+            "## Build\n\n"
+            "```bash\n./gradlew build\n# Unified jar: buildLogic/build/libs/\n```\n"
         )
+
+    # --------------------------------------------------------------- buildLogic
 
     def _generate_build_logic(self, root: Path) -> None:
         bl = root / "buildLogic"
-        kotlin_dir = bl / "src" / "main" / "kotlin"
+        deps = []
+        if self.config.include_api:
+            deps.append("    implementation project(':api')")
+        if self.config.include_common:
+            deps.append("    implementation project(':common')")
+        for platform in self.config.platforms:
+            deps.append(f"    implementation project(':{platform}')")
+        if self.config.include_nms:
+            deps.append("    implementation project(':nms:nms-api')")
+            deps.append("    implementation project(':nms:nms-loader')")
+            deps.append("    implementation project(':nms:nms-paper-modern')")
+            for version in self.config.nms_versions:
+                deps.append(f"    implementation project(':nms:nms-{version}')")
+        content = self._read("buildLogic/build.gradle").replace("{dependencies}", "\n".join(deps))
+        self._write(bl / "build.gradle", content)
 
-        self._write_file(bl / "settings.gradle.kts", self._read_template("buildLogic/settings.gradle.kts"))
-        self._write_file(bl / "build.gradle.kts", self._read_template("buildLogic/build.gradle.kts"))
-
-        for rel in (
-            "mcbuilder/module/McModulePlugin.kt",
-        ):
-            src = self.template_dir / "buildLogic" / "src" / "main" / "kotlin" / rel
-            if src.exists():
-                self._write_file(kotlin_dir / rel, src.read_text())
+    # --------------------------------------------------------------------- api
 
     def _generate_api(self, root: Path) -> None:
-        self._write_file(root / "api" / "build.gradle.kts", (
-            'plugins {\n    `java-library`\n}\n\n'
-            'group = rootProject.group\nversion = rootProject.version\n\n'
-            'java {\n'
-            f'    toolchain.languageVersion.set(JavaLanguageVersion.of({self.config.java_version}))\n'
-            '    withSourcesJar()\n}\n'
-        ))
-        package = self.config.group + ".api"
-        package_path = root / "api" / "src" / "main" / "java" / Path(*package.split("."))
-        self._write_file(
-            package_path / "ProjectApi.java",
-            f"package {package};\n\n"
-            "import java.util.UUID;\n\n"
-            "/** Shared API surface implemented by the server modules. */\n"
-            "public interface ProjectApi {\n\n"
-            "    /** @return the project name, stable across platforms. */\n"
-            "    String projectName();\n\n"
-            "    /** @return whether the given player is currently known to the module. */\n"
-            "    boolean isKnown(UUID playerId);\n"
-            "}\n",
-        )
+        cfg = self.config
+        pkg = cfg.module("api")
+        deps = [
+            "    compileOnly 'org.jetbrains:annotations:26.0.2-1'",
+        ]
+        self._write(root / "api" / "build.gradle",
+                    self._read("api/build.gradle").replace("{dependencies}", "\n".join(deps)))
+        self._write(root / "api" / "src" / "main" / "java" / self._pkg_path(pkg) / "AuroraApi.java",
+                    self._java_api(pkg))
+        self._write(root / "api" / "src" / "main" / "java" / self._pkg_path(pkg) / "PluginAdapter.java",
+                    self._java_plugin_adapter(pkg))
 
-    def _generate_module(self, root: Path, module: Module) -> None:
-        mod_dir = root / module.name
-        src_main = mod_dir / "src" / "main" / "java"
-        src_resources = mod_dir / "src" / "main" / "resources"
-        src_main.mkdir(parents=True, exist_ok=True)
-        src_resources.mkdir(parents=True, exist_ok=True)
+    # ------------------------------------------------------------------ common
 
-        deps = self.server_data.dependencies(module.server, module.version)
-        if self.config.include_api:
-            deps.insert(0, 'implementation(project(":api"))')
-        deps_str = "\n    ".join(deps) if deps else ""
+    def _generate_common(self, root: Path) -> None:
+        cfg = self.config
+        pkg = cfg.module("common")
+        deps = [
+            "    api project(':api')",
+            "",
+            "    compileOnly 'org.jetbrains:annotations:26.0.2-1'",
+            "    compileOnly 'org.projectlombok:lombok:1.18.46'",
+            "    annotationProcessor 'org.projectlombok:lombok:1.18.46'",
+        ]
+        self._write(root / "common" / "build.gradle",
+                    self._read("common/build.gradle").replace("{dependencies}", "\n".join(deps)))
+        self._write(root / "common" / "src" / "main" / "java" / self._pkg_path(pkg) / "core" / f"{cfg.class_prefix}ApiImpl.java",
+                    self._java_api_impl(pkg + ".core"))
 
-        template = self._read_template("build.gradle.kts.module")
-        content = (
-            template
-            .replace("{dependencies}", deps_str)
-            .replace("{java_version}", self.server_data.java_version(module.server, module.version, self.config.java_version))
-        )
-        self._write_file(mod_dir / "build.gradle.kts", content)
+    # ------------------------------------------------------------------ bukkit
 
-        platform = self.server_data.platform(module.server)
-        package = self.config.group
-        class_name = self._class_name(module.name)
+    def _generate_bukkit(self, root: Path) -> None:
+        cfg = self.config
+        pkg = cfg.module("bukkit")
+        deps = ["    compileOnly 'io.papermc.paper:paper-api:' + rootProject.paperVersion"]
+        if cfg.include_api:
+            deps.insert(0, "    implementation project(':api')")
+        if cfg.include_common:
+            deps.insert(1, "    implementation project(':common')")
+        if cfg.include_nms:
+            deps.append("    implementation project(':nms:nms-api')")
+            deps.append("    implementation project(':nms:nms-loader')")
+        self._write(root / "bukkit" / "build.gradle",
+                    self._read("bukkit/build.gradle").replace("{dependencies}", "\n".join(deps)))
+        self._write(root / "bukkit" / "src" / "main" / "java" / self._pkg_path(pkg) / f"{cfg.class_prefix}.java",
+                    self._java_bukkit_main(pkg))
+        self._write(root / "bukkit" / "src" / "main" / "resources" / "plugin.yml",
+                    self._render_plugin_yml())
 
-        if platform == "velocity":
-            pass
-        elif platform == "bungee":
-            self._write_file(src_resources / "bungee.yml", self._render_bungee_yml(module, class_name))
-        else:
-            self._write_file(src_resources / "plugin.yml", self._render_plugin_yml(module, class_name))
-
-        package_path = mod_dir / "src" / "main" / "java" / Path(*package.split("."))
-        package_path.mkdir(parents=True, exist_ok=True)
-        self._write_file(
-            package_path / f"{class_name}.java",
-            self._render_main_class(class_name, module, platform),
-        )
-
-    def _render_plugin_yml(self, module: Module, class_name: str) -> str:
+    def _render_plugin_yml(self) -> str:
+        cfg = self.config
         return (
-            f"name: {module.name}\n"
-            f"version: '{self.config.version}'\n"
-            f"main: {self.config.group}.{class_name}\n"
-            f"description: {self.config.description or module.name}\n"
-            f"api-version: '{module.version.split('-')[0]}'\n"
-            f"author: {self.config.group}\n"
+            f"name: {cfg.name}\n"
+            f"version: ${{version}}\n"
+            f"main: {cfg.base_package}.bukkit.{cfg.class_prefix}\n"
+            f"api: '{self._api_version()}'\n"
+            f"description: {cfg.description or cfg.name}\n"
+            f"authors: [ {cfg.group} ]\n"
         )
 
-    def _render_bungee_yml(self, module: Module, class_name: str) -> str:
-        return (
-            f"name: {module.name}\n"
-            f"version: '{self.config.version}'\n"
-            f"main: {self.config.group}.{class_name}\n"
-            f"description: {self.config.description or module.name}\n"
-            f"author: {self.config.group}\n"
-        )
+    # ---------------------------------------------------------------- velocity
 
-    def _render_main_class(self, class_name: str, module: Module, platform: str) -> str:
-        pkg = self.config.group
-        if platform == "velocity":
-            plugin_id = re.sub(r"[^a-z0-9_-]", "-", module.name.lower())
-            return (
-                f"package {pkg};\n\n"
-                f"import com.google.inject.Inject;\n"
-                f"import com.velocitypowered.api.event.Subscribe;\n"
-                f"import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;\n"
-                f"import com.velocitypowered.api.plugin.Plugin;\n"
-                f"import com.velocitypowered.api.proxy.ProxyServer;\n"
-                f"import org.slf4j.Logger;\n\n"
-                f"@Plugin(id = \"{plugin_id}\")\n"
-                f"public final class {class_name} {{\n\n"
-                f"    private final ProxyServer server;\n"
-                f"    private final Logger logger;\n\n"
-                f"    @Inject\n"
-                f"    public {class_name}(ProxyServer server, Logger logger) {{\n"
-                f"        this.server = server;\n"
-                f"        this.logger = logger;\n"
-                f"    }}\n\n"
-                f"    @Subscribe\n"
-                f"    public void onProxyInitialize(ProxyInitializeEvent event) {{\n"
-                f"        logger.info(\"{module.name} enabled.\");\n"
-                f"    }}\n"
-                f"}}\n"
-            )
-        if platform == "bungee":
-            return (
-                f"package {pkg};\n\n"
-                f"import net.md_5.bungee.api.plugin.Plugin;\n\n"
-                f"public final class {class_name} extends Plugin {{\n"
-                f"    @Override\n"
-                f"    public void onEnable() {{\n"
-                f"        getLogger().info(\"{module.name} enabled.\");\n"
-                f"    }}\n"
-                f"}}\n"
-            )
+    def _generate_velocity(self, root: Path) -> None:
+        cfg = self.config
+        pkg = cfg.module("velocity")
+        deps = [
+            "    compileOnly \"com.velocitypowered:velocity-api:${rootProject.velocityVersion}\"",
+            "    annotationProcessor \"com.velocitypowered:velocity-api:${rootProject.velocityVersion}\"",
+        ]
+        if cfg.include_api:
+            deps.insert(0, "    implementation project(':api')")
+        if cfg.include_common:
+            deps.insert(1, "    implementation project(':common')")
+        if cfg.include_nms:
+            deps.append("    implementation project(':nms:nms-api')")
+        self._write(root / "velocity" / "build.gradle",
+                    self._read("velocity/build.gradle").replace("{dependencies}", "\n".join(deps)))
+        self._write(root / "velocity" / "src" / "main" / "java" / self._pkg_path(pkg) / f"{cfg.class_prefix}Velocity.java",
+                    self._java_velocity_main(pkg))
+
+    # --------------------------------------------------------------------- nms
+
+    def _generate_nms(self, root: Path) -> None:
+        cfg = self.config
+        nms = root / "nms"
+        base = cfg.module("nms")
+        self._write(nms / "nms-api" / "build.gradle", self._read("nms/nms-api/build.gradle"))
+        self._write(nms / "nms-api" / "src" / "main" / "java" / self._pkg_path(base) / "Nms.java",
+                    self._java_nms_access(base))
+        self._write(nms / "nms-api" / "src" / "main" / "java" / self._pkg_path(base) / "NmsHandler.java",
+                    self._java_nms_handler(base))
+        self._write(nms / "nms-api" / "src" / "main" / "java" / self._pkg_path(base) / "NmsProvider.java",
+                    self._java_nms_provider(base))
+
+        self._write(nms / "nms-loader" / "build.gradle", self._read("nms/nms-loader/build.gradle"))
+        self._write(nms / "nms-loader" / "src" / "main" / "java" / self._pkg_path(base + ".loader") / "NmsLoader.java",
+                    self._java_nms_loader(base))
+
+        self._write(nms / "nms-paper-modern" / "build.gradle", self._read("nms/nms-paper-modern/build.gradle"))
+        self._write(nms / "nms-paper-modern" / "src" / "main" / "java" / self._pkg_path(base + ".paper_modern") / "NmsHandlerImpl.java",
+                    self._java_nms_impl(base + ".paper_modern", "paper-modern"))
+        self._write(nms / "nms-paper-modern" / "src" / "main" / "resources" / "META-INF" / "services" / f"{base}.NmsProvider",
+                    base + ".paper_modern.NmsHandlerImpl$Provider\n")
+
+        for version in cfg.nms_versions:
+            info = self.nms.info(version)
+            mod = nms / f"nms-{version}"
+            self._write(mod / "build.gradle", self._render_nms_version_build(version, info))
+            self._write(mod / "src" / "main" / "java" / self._pkg_path(base + f".{version}") / "NmsHandlerImpl.java",
+                        self._java_nms_impl(base + f".{version}", version))
+            self._write(mod / "src" / "main" / "resources" / "META-INF" / "services" / f"{base}.NmsProvider",
+                        base + f".{version}.NmsHandlerImpl$Provider\n")
+
+    def _render_nms_version_build(self, version: str, info: dict) -> str:
+        toolchain = info.get("java", "21")
+        mc = info.get("mc", version)
+        return self._read("nms/nms-v/build.gradle").replace("{java}", str(toolchain)).replace("{mc}", mc)
+
+    # ------------------------------------------------------------ java sources
+
+    def _java_api(self, pkg: str) -> str:
         return (
             f"package {pkg};\n\n"
-            f"import org.bukkit.plugin.java.JavaPlugin;\n\n"
-            f"public final class {class_name} extends JavaPlugin {{\n"
-            f"    @Override\n"
-            f"    public void onEnable() {{\n"
-            f"        getLogger().info(\"{module.name} enabled.\");\n"
-            f"    }}\n\n"
-            f"    @Override\n"
-            f"    public void onDisable() {{\n"
-            f"        getLogger().info(\"{module.name} disabled.\");\n"
-            f"    }}\n"
-            f"}}\n"
+            "import java.util.concurrent.CompletableFuture;\n\n"
+            "/** Public API surface shared across platforms. */\n"
+            "public interface AuroraApi {\n\n"
+            "    /** @return the running version string. */\n"
+            "    String version();\n\n"
+            "    /** @return a future completing once the platform is ready. */\n"
+            "    CompletableFuture<Void> ready();\n"
+            "}\n"
         )
 
-    def _class_name(self, module_name: str) -> str:
-        parts = re.split(r"[-_.]", module_name)
-        parts = [p for p in parts if p]
-        return "".join(p.title() for p in parts) + "Plugin"
+    def _java_plugin_adapter(self, pkg: str) -> str:
+        return (
+            f"package {pkg};\n\n"
+            "import java.io.File;\n"
+            "import java.util.logging.Logger;\n\n"
+            "/** Minimal, platform-agnostic adapter passed from a platform into the core. */\n"
+            "public interface PluginAdapter {\n"
+            "    File getDataFolder();\n"
+            "    Logger getLogger();\n"
+            "    String getPlatform();\n"
+            "}\n"
+        )
 
-    def _read_template(self, name: str) -> str:
+    def _java_api_impl(self, pkg: str) -> str:
+        cfg = self.config
+        iface = cfg.module("api") + ".AuroraApi"
+        return (
+            f"package {pkg};\n\n"
+            "import java.util.concurrent.CompletableFuture;\n"
+            f"import {iface};\n\n"
+            "/** Default implementation of the shared API. */\n"
+            "public final class " + cfg.class_prefix + "ApiImpl implements AuroraApi {\n\n"
+            "    private final String version;\n\n"
+            "    public " + cfg.class_prefix + "ApiImpl(String version) {\n"
+            "        this.version = version;\n"
+            "    }\n\n"
+            "    @Override\n"
+            "    public String version() {\n"
+            "        return version;\n"
+            "    }\n\n"
+            "    @Override\n"
+            "    public CompletableFuture<Void> ready() {\n"
+            "        return CompletableFuture.completedFuture(null);\n"
+            "    }\n"
+            "}\n"
+        )
+
+    def _java_bukkit_main(self, pkg: str) -> str:
+        cfg = self.config
+        return (
+            f"package {pkg};\n\n"
+            "import org.bukkit.plugin.java.JavaPlugin;\n\n"
+            f"public final class {cfg.class_prefix} extends JavaPlugin {{\n\n"
+            "    @Override\n"
+            "    public void onEnable() {\n"
+            f"        getLogger().info(\"{cfg.name} enabled.\");\n"
+            "    }\n\n"
+            "    @Override\n"
+            "    public void onDisable() {\n"
+            f"        getLogger().info(\"{cfg.name} disabled.\");\n"
+            "    }\n"
+            "}\n"
+        )
+
+    def _java_velocity_main(self, pkg: str) -> str:
+        cfg = self.config
+        plugin_id = re.sub(r"[^a-z0-9_-]", "-", cfg.slug)
+        return (
+            f"package {pkg};\n\n"
+            "import com.google.inject.Inject;\n"
+            "import com.velocitypowered.api.event.Subscribe;\n"
+            "import com.velocitypowered.api.event.proxy.ProxyInitializeEvent;\n"
+            "import com.velocitypowered.api.plugin.Plugin;\n"
+            "import com.velocitypowered.api.proxy.ProxyServer;\n"
+            "import org.slf4j.Logger;\n\n"
+            f"@Plugin(id = \"{plugin_id}\")\n"
+            f"public final class {cfg.class_prefix}Velocity {{\n\n"
+            "    private final ProxyServer server;\n"
+            "    private final Logger logger;\n\n"
+            "    @Inject\n"
+            f"    public {cfg.class_prefix}Velocity(ProxyServer server, Logger logger) {{\n"
+            "        this.server = server;\n"
+            "        this.logger = logger;\n"
+            "    }\n\n"
+            "    @Subscribe\n"
+            "    public void onProxyInitialize(ProxyInitializeEvent event) {\n"
+            f"        logger.info(\"{cfg.name} enabled.\");\n"
+            "    }\n"
+            "}\n"
+        )
+
+    def _java_nms_access(self, pkg: str) -> str:
+        return (
+            f"package {pkg};\n\n"
+            "/** Global access point for the current NMS handler. */\n"
+            "public final class Nms {\n\n"
+            "    private static NmsHandler handler;\n\n"
+            "    private Nms() {}\n\n"
+            "    public static void init(NmsHandler handler) {\n"
+            "        Nms.handler = handler;\n"
+            "    }\n\n"
+            "    public static NmsHandler get() {\n"
+            "        if (handler == null) {\n"
+            "            throw new IllegalStateException(\"Nms not initialised. Call Nms.init() first.\");\n"
+            "        }\n"
+            "        return handler;\n"
+            "    }\n\n"
+            "    public static boolean isInitialized() {\n"
+            "        return handler != null;\n"
+            "    }\n\n"
+            "    public static void reset() {\n"
+            "        handler = null;\n"
+            "    }\n"
+            "}\n"
+        )
+
+    def _java_nms_handler(self, pkg: str) -> str:
+        return (
+            f"package {pkg};\n\n"
+            "import org.bukkit.entity.Player;\n\n"
+            "/** Version-agnostic NMS operations. Implemented once per server version. */\n"
+            "public interface NmsHandler {\n\n"
+            "    /** @return the NMS version handled (e.g. \"v1_21_R3\"). */\n"
+            "    String getNmsVersion();\n\n"
+            "    /** Send an action bar message to a player. */\n"
+            "    void sendActionBar(Player player, String message);\n\n"
+            "    /** @return the player's ping in milliseconds. */\n"
+            "    int getPing(Player player);\n"
+            "}\n"
+        )
+
+    def _java_nms_provider(self, pkg: str) -> str:
+        return (
+            f"package {pkg};\n\n"
+            "/** ServiceLoader provider; one per NMS implementation. */\n"
+            "public interface NmsProvider {\n\n"
+            "    /** @return the supported NMS version (e.g. \"v1_21_R3\"). */\n"
+            "    String version();\n\n"
+            "    /** Create the handler instance. */\n"
+            "    NmsHandler create();\n"
+            "}\n"
+        )
+
+    def _java_nms_loader(self, pkg: str) -> str:
+        return (
+            f"package {pkg};\n\n"
+            "import java.util.ServiceLoader;\n"
+            "import java.util.logging.Level;\n"
+            "import java.util.logging.Logger;\n\n"
+            f"import {self.config.module('nms')}.Nms;\n"
+            f"import {self.config.module('nms')}.NmsHandler;\n"
+            f"import {self.config.module('nms')}.NmsProvider;\n\n"
+            "/** Detects the server version and loads the matching NMS handler. */\n"
+            "public final class NmsLoader {\n\n"
+            "    private static final Logger LOGGER = Logger.getLogger(\"NMS-Loader\");\n\n"
+            "    private NmsLoader() {}\n\n"
+            "    public static boolean load() {\n"
+            "        String version = detectVersion();\n"
+            "        LOGGER.info(\"Detected NMS version: \" + version);\n"
+            "        try {\n"
+            "            for (NmsProvider provider : ServiceLoader.load(NmsProvider.class)) {\n"
+            "                if (provider.version().equals(version)) {\n"
+            "                    Nms.init(provider.create());\n"
+            "                    LOGGER.info(\"Loaded NMS handler: \" + version);\n"
+            "                    return true;\n"
+            "                }\n"
+            "            }\n"
+            "        } catch (Throwable t) {\n"
+            "            LOGGER.log(Level.WARNING, \"NMS ServiceLoader failed\", t);\n"
+            "        }\n"
+            "        LOGGER.warning(\"No NMS handler found for version: \" + version);\n"
+            "        return false;\n"
+            "    }\n\n"
+            "    public static String detectVersion() {\n"
+            "        try {\n"
+            "            String pkg = org.bukkit.Bukkit.getServer().getClass().getPackage().getName();\n"
+            "            String[] parts = pkg.split(\"\\\\.\");\n"
+            "            if (parts.length >= 4 && parts[3].startsWith(\"v\")) {\n"
+            "                return parts[3];\n"
+            "            }\n"
+            "        } catch (Throwable ignored) {\n"
+            "            // fall through to modern detection\n"
+            "        }\n"
+            "        return \"paper-modern\";\n"
+            "    }\n"
+            "}\n"
+        )
+
+    def _java_nms_impl(self, pkg: str, version: str) -> str:
+        ns = self.config.module("nms")
+        return (
+            f"package {pkg};\n\n"
+            "import org.bukkit.entity.Player;\n\n"
+            f"import {ns}.NmsHandler;\n"
+            f"import {ns}.NmsProvider;\n\n"
+            f"/** NMS handler for {version}. Add version-specific code here. */\n"
+            "public class NmsHandlerImpl implements NmsHandler {\n\n"
+            "    @Override\n"
+            "    public String getNmsVersion() {\n"
+            f"        return \"{version}\";\n"
+            "    }\n\n"
+            "    @Override\n"
+            "    public void sendActionBar(Player player, String message) {\n"
+            "        player.sendActionBar(message);\n"
+            "    }\n\n"
+            "    @Override\n"
+            "    public int getPing(Player player) {\n"
+            "        return player.getPing();\n"
+            "    }\n\n"
+            "    public static class Provider implements NmsProvider {\n"
+            "        @Override\n"
+            "        public String version() {\n"
+            f"            return \"{version}\";\n"
+            "        }\n\n"
+            "        @Override\n"
+            "        public NmsHandler create() {\n"
+            "            return new NmsHandlerImpl();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+
+    # ------------------------------------------------------------------ helpers
+
+    def _versions(self) -> dict:
+        return {
+            "paper": "1.21.4-R0.1-SNAPSHOT",
+            "velocity": "3.4.0",
+            "annotations": "26.0.2-1",
+            "lombok": "1.18.46",
+            "junit": "5.14.4",
+        }
+
+    def _api_version(self) -> str:
+        return "1.21"
+
+    def _pkg_path(self, pkg: str) -> Path:
+        return Path(*pkg.split("."))
+
+    def _write_wrapper(self, root: Path) -> None:
+        gradle_dir = root / "gradle" / "wrapper"
+        gradle_dir.mkdir(parents=True, exist_ok=True)
+        props = self._read("gradle-wrapper.properties").replace("{gradle_version}", self.config.gradle_version)
+        self._write(gradle_dir / "gradle-wrapper.properties", props)
+        self._copy_binary(gradle_dir / "gradle-wrapper.jar", self.template_dir / "gradle-wrapper.jar")
+        self._write(root / "gradlew", self._read("gradlew"))
+        self._write(root / "gradlew.bat", self._read("gradlew.bat"))
+        self._chmod_exec(root / "gradlew")
+
+    def _read(self, name: str) -> str:
         return (self.template_dir / name).read_text(encoding="utf-8")
 
-    def _write_file(self, path: Path, content: str) -> None:
+    def _write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
     def _copy_binary(self, dest: Path, src: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(src.read_bytes())
+
+    def _chmod_exec(self, path: Path) -> None:
+        try:
+            path.chmod(0o755)
+        except OSError:
+            pass

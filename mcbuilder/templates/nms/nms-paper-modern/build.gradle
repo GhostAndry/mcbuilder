@@ -1,0 +1,8 @@
+plugins {
+    id 'java'
+}
+
+dependencies {
+    compileOnly project(':nms:nms-api')
+    compileOnly 'io.papermc.paper:paper-api:' + rootProject.paperVersion
+}
